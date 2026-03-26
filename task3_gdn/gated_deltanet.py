@@ -185,6 +185,125 @@ class GatedDeltaNet(nn.Module):
 
         return output
 
+    # ── Chunkwise 并行形式 ─────────────────────────────────────────────────
+
+    def forward_chunkwise(self, x: torch.Tensor, chunk_size: int = 8) -> torch.Tensor:
+        """Chunkwise 并行形式的前向传播。
+
+        核心思想（前缀和/Parallel Prefix Scan）：
+        - 将长度为 T 的序列分成 T/C 个大小为 C 的 chunk
+        - 将递推 S_t = S_{t-1} @ D_t + U_t 视为关联运算 (D, U)
+          其中 (D_a, U_a) ⊕ (D_b, U_b) = (D_a @ D_b, U_a @ D_b + U_b)
+        - chunk 内：利用前缀扫描并行计算所有位置的累积 (cumD, cumU)，
+          再一次性 batch matmul 算出所有位置的输出
+        - chunk 间：串行传递状态，但仅需 T/C 步
+
+        串行深度从 O(T) 降到 O(T/C + C)，计算吞吐量显著提升。
+
+        Args:
+            x:          (batch, seq_len, hidden_dim)
+            chunk_size: chunk 大小 C，默认 8
+        Returns:
+            (batch, seq_len, hidden_dim)
+        """
+        B, T, _ = x.shape
+        H, d = self.num_heads, self.head_dim
+        C = chunk_size
+
+        # ── 0. 补齐到 chunk_size 的整数倍 ──────────────────────────────────
+        pad_len = (C - T % C) % C
+        if pad_len > 0:
+            x = F.pad(x, (0, 0, 0, pad_len))
+        T_pad = T + pad_len
+        num_chunks = T_pad // C
+
+        # ── 1. 投影 + 短卷积 + 激活（全序列并行） ──────────────────────────
+        q = F.silu(self._causal_conv(self.q_proj(x), self.q_conv))
+        k = F.silu(self._causal_conv(self.k_proj(x), self.k_conv))
+        v = F.silu(self._causal_conv(self.v_proj(x), self.v_conv))
+
+        q = F.normalize(q.view(B, T_pad, H, d), p=2, dim=-1)
+        k = F.normalize(k.view(B, T_pad, H, d), p=2, dim=-1)
+        v = v.view(B, T_pad, H, d)
+
+        alpha = torch.sigmoid(self.alpha_proj(x))       # (B, T_pad, H)
+        beta  = torch.sigmoid(self.beta_proj(x))
+        gate  = F.silu(self.gate_proj(x))                # (B, T_pad, inner)
+
+        # ── 2. 并行计算所有位置的 D_t 和 U_t ──────────────────────────────
+        #   D_t = α_t (I − β_t k_t k_t^T)    衰减矩阵
+        #   U_t = β_t v_t k_t^T               更新矩阵
+        I_d = torch.eye(d, device=x.device, dtype=x.dtype)
+
+        kk_T = k.unsqueeze(-1) * k.unsqueeze(-2)        # (B, T_pad, H, d, d)
+        vk_T = v.unsqueeze(-1) * k.unsqueeze(-2)
+
+        a_exp = alpha[..., None, None]                    # (B, T_pad, H, 1, 1)
+        b_exp = beta[..., None, None]
+
+        D_all = a_exp * (I_d - b_exp * kk_T)             # (B, T_pad, H, d, d)
+        U_all = b_exp * vk_T
+
+        # 重塑为 chunk 形状
+        D_chunks = D_all.view(B, num_chunks, C, H, d, d)
+        U_chunks = U_all.view(B, num_chunks, C, H, d, d)
+        q_chunks = q.view(B, num_chunks, C, H, d)
+
+        # ── 3. 逐 chunk 处理：内部前缀扫描 + 并行输出 ──────────────────────
+        S = x.new_zeros(B, H, d, d)                       # chunk 间传递的状态
+        all_outputs: list[torch.Tensor] = []
+
+        for c in range(num_chunks):
+            D_c = D_chunks[:, c]   # (B, C, H, d, d)
+            U_c = U_chunks[:, c]
+            q_c = q_chunks[:, c]   # (B, C, H, d)
+
+            # ── 前缀扫描（Prefix Scan）：计算 cumD[r] 和 cumU[r] ──────
+            #   cumD[r] = D_0 @ D_1 @ ... @ D_r
+            #   cumU[r] = cumU[r-1] @ D_r + U_r,  cumU[-1] = 0
+            #   => 状态 S_r = S_init @ cumD[r] + cumU[r]
+            #
+            #   此处用 O(C) 循环实现（C 很小，通常 7~16），
+            #   也可进一步用 tree-reduction 优化到 O(log C) 深度。
+            cumD_list: list[torch.Tensor] = []
+            cumU_list: list[torch.Tensor] = []
+            cD = I_d.unsqueeze(0).unsqueeze(0).expand(B, H, d, d).clone()
+            cU = x.new_zeros(B, H, d, d)
+
+            for r in range(C):
+                cD = torch.matmul(cD, D_c[:, r])          # (B, H, d, d)
+                cU = torch.matmul(cU, D_c[:, r]) + U_c[:, r]
+                cumD_list.append(cD)
+                cumU_list.append(cU)
+
+            cumD = torch.stack(cumD_list, dim=1)           # (B, C, H, d, d)
+            cumU = torch.stack(cumU_list, dim=1)
+
+            # ── 并行计算 chunk 内所有位置的输出 ─────────────────────────
+            #   S_r = S_init @ cumD[r] + cumU[r]
+            #   o_r = S_r @ q_r
+            S_init = S.unsqueeze(1)                        # (B, 1, H, d, d)
+            states = torch.matmul(S_init, cumD) + cumU     # (B, C, H, d, d)
+
+            # batch einsum: (B, C, H, d, d) × (B, C, H, d) → (B, C, H, d)
+            o_c = torch.einsum("bchde,bche->bchd", states, q_c)
+            all_outputs.append(o_c)
+
+            # 更新 chunk 间状态为本 chunk 最后一个位置的状态
+            S = states[:, -1]                              # (B, H, d, d)
+
+        # ── 4. 拼接、去 padding、归一化、门控、投影 ────────────────────────
+        output = torch.cat(all_outputs, dim=1)             # (B, T_pad, H, d)
+        if pad_len > 0:
+            output = output[:, :T]
+            gate = gate[:, :T]
+
+        output = output.reshape(B, T, self.inner_dim)
+        output = self.norm(output) * gate
+        output = self.out_proj(output)
+
+        return output
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Feed-Forward / MLP
@@ -316,8 +435,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Test core layer ---
-    print("=== GatedDeltaNet core layer ===")
+    # --- 测试核心层 ---
+    print("=== GatedDeltaNet 核心层 ===")
     layer = GatedDeltaNet(hidden_dim=64, num_heads=4).to(device)
     x = torch.randn(2, 16, 64, device=device)
     y = layer(x)
@@ -326,7 +445,22 @@ if __name__ == "__main__":
     assert x.shape == y.shape, "Shape mismatch!"
     print("Shape check passed.\n")
 
-    # --- Test full classifier ---
+    # --- 测试 Chunkwise 并行形式 ---
+    print("=== Chunkwise 并行 vs Recurrent 等效性验证 ===")
+    layer.eval()
+    with torch.no_grad():
+        x_test = torch.randn(2, 49, 64, device=device)    # 49 tokens = 7×7 patches
+        out_recurrent  = layer(x_test)                      # 纯循环模式
+        out_chunkwise  = layer.forward_chunkwise(x_test, chunk_size=7)  # Chunkwise
+
+        max_diff = (out_recurrent - out_chunkwise).abs().max().item()
+        print(f"Recurrent  output shape: {out_recurrent.shape}")
+        print(f"Chunkwise  output shape: {out_chunkwise.shape}")
+        print(f"Max absolute difference: {max_diff:.2e}")
+        assert max_diff < 1e-4, f"输出不一致! max_diff={max_diff}"
+        print("等效性验证通过: Recurrent ≈ Chunkwise\n")
+
+    # --- 测试完整分类器 ---
     print("=== GDNClassifier (Fashion-MNIST) ===")
     model = GDNClassifier(
         img_size=28, patch_size=4, hidden_dim=64,

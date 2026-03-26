@@ -38,7 +38,7 @@ CONFIG = {
     "mlp_expansion": 2,
     "num_classes":   10,
     # Training
-    "epochs":        20,
+    "epochs":        10,
     "batch_size":    128,
     "lr":            1e-3,
     "weight_decay":  1e-4,
