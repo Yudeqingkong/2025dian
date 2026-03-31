@@ -3,3 +3,4 @@ __pycache__/
 data/
 *.pth
 *.png
+!task3_gdn/training_curves.png
