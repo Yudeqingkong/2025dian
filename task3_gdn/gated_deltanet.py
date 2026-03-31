@@ -29,6 +29,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -69,7 +70,7 @@ class GatedDeltaNet(nn.Module):
         self,
         hidden_dim: int,
         num_heads: int,
-        head_dim: int | None = None,
+        head_dim: Optional[int] = None,
         conv_size: int = 4,
     ):
         super().__init__()
